@@ -1,29 +1,48 @@
-import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-	SELF,
-} from "cloudflare:test";
-import { describe, it, expect } from "vitest";
-import worker from "../src/index";
+import { SELF } from 'cloudflare:test';
+import { describe, it, expect } from 'vitest';
 
-// For now, you'll need to do something like this to get a correctly-typed
-// `Request` to pass to `worker.fetch()`.
-const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
+describe('sticky assignment router', () => {
+	it('routes cacheable lookups through the named entrypoint', async () => {
+		const response = await SELF.fetch('https://example.com/route?customer=cust_123&endpoint=primary-api&locality=region-a');
 
-describe("Hello World worker", () => {
-	it("responds with Hello World! (unit style)", async () => {
-		const request = new IncomingRequest("http://example.com");
-		// Create an empty context to pass to `worker.fetch()`.
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
-		await waitOnExecutionContext(ctx);
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+		expect(response.status).toBe(200);
+		expect(response.headers.get('Cache-Control')).toBe('no-store');
+		expect(response.headers.get('Cloudflare-CDN-Cache-Control')).toContain('max-age=30');
+		expect(response.headers.get('X-Origin-Path')).toBe('durable-object-rpc');
+
+		const body = await response.json<{
+			customerId: string;
+			endpointGroup: string;
+			locality: string;
+			pool: string;
+			source: string;
+		}>();
+
+		expect(body).toMatchObject({
+			customerId: 'cust_123',
+			endpointGroup: 'primary-api',
+			locality: 'region-a',
+			source: 'durable-object-rpc',
+		});
+		expect(body.pool).toMatch(/^pool-[a-d]$/);
 	});
 
-	it("responds with Hello World! (integration style)", async () => {
-		const response = await SELF.fetch("https://example.com");
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+	it('persists sticky assignments in the Durable Object', async () => {
+		const url = 'https://example.com/route?customer=cust_456&endpoint=secondary-api&locality=global';
+		const first = await SELF.fetch(url);
+		const second = await SELF.fetch(url);
+
+		expect(first.status).toBe(200);
+		expect(second.status).toBe(200);
+		expect(await first.json()).toEqual(await second.json());
+	});
+
+	it('rejects non-cacheable methods at the gateway', async () => {
+		const response = await SELF.fetch('https://example.com/route?customer=cust_123', {
+			method: 'POST',
+		});
+
+		expect(response.status).toBe(405);
+		expect(response.headers.get('Cache-Control')).toBe('no-store');
 	});
 });
