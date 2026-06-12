@@ -1,43 +1,21 @@
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import {
-	buildCacheRequest,
+	AssignmentRequest,
+	AssignmentRow,
+	Assignment,
+	POOLS,
+	assignmentFromRow,
+	buildCacheableRouteRequest,
 	cachedRead,
 	hashToBucket,
 	jsonWithWorkersCache,
-	parseCacheRequest,
-	readSafeSearchParam,
+	parseAssignmentCacheRequest,
 	rejectNonCacheableRead,
 } from './cache-helpers';
 
-const SHARD_COUNT = 256;
 const ASSIGNMENT_EDGE_TTL_SECONDS = 30;
 const ASSIGNMENT_STALE_SECONDS = 300;
 const ASSIGNMENT_STALE_IF_ERROR_SECONDS = 3600;
-const POOLS = ['pool-a', 'pool-b', 'pool-c', 'pool-d'] as const;
-
-type AssignmentRequest = {
-	endpointGroup: string;
-	customerId: string;
-	locality: string;
-	shard: string;
-};
-
-type Assignment = AssignmentRequest & {
-	pool: (typeof POOLS)[number];
-	createdAt: number;
-	updatedAt: number;
-	source: 'durable-object-rpc';
-};
-
-type AssignmentRow = {
-	customer_id: string;
-	endpoint_group: string;
-	locality: string;
-	shard: string;
-	pool: (typeof POOLS)[number];
-	created_at: number;
-	updated_at: number;
-};
 
 export class StickyAssignmentDurableObject extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -161,59 +139,3 @@ export default {
 		return cachedRead(ctx.exports.CachedAssignmentLookup, routeRequest, request.method);
 	},
 } satisfies ExportedHandler<Env>;
-
-async function buildCacheableRouteRequest(url: URL): Promise<Request | Response> {
-	const customerId = readSafeSearchParam(url, 'customer');
-	if (customerId instanceof Response) {
-		return customerId;
-	}
-
-	const endpointGroup = readSafeSearchParam(url, 'endpoint', 'primary-api');
-	if (endpointGroup instanceof Response) {
-		return endpointGroup;
-	}
-
-	const locality = readSafeSearchParam(url, 'locality', 'global');
-	if (locality instanceof Response) {
-		return locality;
-	}
-
-	const shard = String(await hashToBucket(`${endpointGroup}:${customerId}`, SHARD_COUNT)).padStart(3, '0');
-	return buildCacheRequest({
-		resource: 'assignments',
-		segments: [endpointGroup, shard, customerId],
-		search: { locality },
-	});
-}
-
-function parseAssignmentCacheRequest(request: Request): AssignmentRequest | Response {
-	const parsed = parseCacheRequest(request, {
-		resource: 'assignments',
-		segmentNames: ['endpointGroup', 'shard', 'customerId'],
-		searchNames: ['locality'],
-	});
-
-	if (parsed instanceof Response) {
-		return parsed;
-	}
-
-	return {
-		customerId: parsed.segments.customerId,
-		endpointGroup: parsed.segments.endpointGroup,
-		locality: parsed.search.locality,
-		shard: parsed.segments.shard,
-	};
-}
-
-function assignmentFromRow(row: AssignmentRow): Assignment {
-	return {
-		customerId: row.customer_id,
-		endpointGroup: row.endpoint_group,
-		locality: row.locality,
-		shard: row.shard,
-		pool: row.pool,
-		createdAt: row.created_at,
-		updatedAt: row.updated_at,
-		source: 'durable-object-rpc',
-	};
-}
