@@ -1,11 +1,19 @@
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
+import {
+	buildCacheRequest,
+	cachedRead,
+	hashToBucket,
+	jsonWithWorkersCache,
+	parseCacheRequest,
+	readSafeSearchParam,
+	rejectNonCacheableRead,
+} from './cache-helpers';
 
 const SHARD_COUNT = 256;
 const ASSIGNMENT_EDGE_TTL_SECONDS = 30;
 const ASSIGNMENT_STALE_SECONDS = 300;
 const ASSIGNMENT_STALE_IF_ERROR_SECONDS = 3600;
 const POOLS = ['pool-a', 'pool-b', 'pool-c', 'pool-d'] as const;
-const SAFE_CACHE_VALUE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 type AssignmentRequest = {
 	endpointGroup: string;
@@ -97,11 +105,9 @@ export class StickyAssignmentDurableObject extends DurableObject<Env> {
 
 export class CachedAssignmentLookup extends WorkerEntrypoint<Env> {
 	async fetch(request: Request): Promise<Response> {
-		if (request.method !== 'GET' && request.method !== 'HEAD') {
-			return new Response('Only GET and HEAD can use Workers Caching', {
-				status: 405,
-				headers: { 'Cache-Control': 'no-store' },
-			});
+		const methodError = rejectNonCacheableRead(request);
+		if (methodError) {
+			return methodError;
 		}
 
 		const input = parseAssignmentCacheRequest(request);
@@ -112,12 +118,12 @@ export class CachedAssignmentLookup extends WorkerEntrypoint<Env> {
 		const stub = this.env.STICKY_ASSIGNMENTS.getByName(`${input.endpointGroup}:${input.shard}`);
 		const assignment = await stub.getAssignment(input);
 
-		return Response.json(assignment, {
-			headers: {
-				'Cache-Control': 'no-store',
-				'Cloudflare-CDN-Cache-Control': `public, max-age=${ASSIGNMENT_EDGE_TTL_SECONDS}, stale-while-revalidate=${ASSIGNMENT_STALE_SECONDS}, stale-if-error=${ASSIGNMENT_STALE_IF_ERROR_SECONDS}`,
-				'Cache-Tag': ['sticky-assignments', `endpoint:${input.endpointGroup}`, `shard:${input.shard}`].join(','),
-				'Content-Type': 'application/json',
+		return jsonWithWorkersCache(assignment, {
+			edgeTtlSeconds: ASSIGNMENT_EDGE_TTL_SECONDS,
+			staleWhileRevalidateSeconds: ASSIGNMENT_STALE_SECONDS,
+			staleIfErrorSeconds: ASSIGNMENT_STALE_IF_ERROR_SECONDS,
+			tags: ['sticky-assignments', `endpoint:${input.endpointGroup}`, `shard:${input.shard}`],
+			extraHeaders: {
 				'X-Origin-Path': 'durable-object-rpc',
 			},
 		});
@@ -142,11 +148,9 @@ export default {
 			});
 		}
 
-		if (request.method !== 'GET' && request.method !== 'HEAD') {
-			return new Response('Only GET and HEAD are cacheable', {
-				status: 405,
-				headers: { 'Cache-Control': 'no-store' },
-			});
+		const methodError = rejectNonCacheableRead(request, 'Only GET and HEAD are cacheable');
+		if (methodError) {
+			return methodError;
 		}
 
 		const routeRequest = await buildCacheableRouteRequest(url);
@@ -154,86 +158,51 @@ export default {
 			return routeRequest;
 		}
 
-		const cachedLookupResponse = await ctx.exports.CachedAssignmentLookup.fetch(routeRequest);
-
-		if (request.method === 'HEAD') {
-			return new Response(null, {
-				status: cachedLookupResponse.status,
-				headers: cachedLookupResponse.headers,
-			});
-		}
-
-		return cachedLookupResponse;
+		return cachedRead(ctx.exports.CachedAssignmentLookup, routeRequest, request.method);
 	},
 } satisfies ExportedHandler<Env>;
 
 async function buildCacheableRouteRequest(url: URL): Promise<Request | Response> {
-	const customerId = readSafeParam(url, 'customer');
+	const customerId = readSafeSearchParam(url, 'customer');
 	if (customerId instanceof Response) {
 		return customerId;
 	}
 
-	const endpointGroup = readSafeParam(url, 'endpoint', 'primary-api');
+	const endpointGroup = readSafeSearchParam(url, 'endpoint', 'primary-api');
 	if (endpointGroup instanceof Response) {
 		return endpointGroup;
 	}
 
-	const locality = readSafeParam(url, 'locality', 'global');
+	const locality = readSafeSearchParam(url, 'locality', 'global');
 	if (locality instanceof Response) {
 		return locality;
 	}
 
 	const shard = String(await hashToBucket(`${endpointGroup}:${customerId}`, SHARD_COUNT)).padStart(3, '0');
-	const cacheUrl = new URL('https://assignment-cache.internal/assignments');
-	cacheUrl.pathname = ['', 'assignments', encodeURIComponent(endpointGroup), shard, encodeURIComponent(customerId)].join('/');
-	cacheUrl.searchParams.set('locality', locality);
-
-	return new Request(cacheUrl, { method: 'GET' });
+	return buildCacheRequest({
+		resource: 'assignments',
+		segments: [endpointGroup, shard, customerId],
+		search: { locality },
+	});
 }
 
 function parseAssignmentCacheRequest(request: Request): AssignmentRequest | Response {
-	const url = new URL(request.url);
-	const [resource, endpointGroup, shard, customerId] = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-	const locality = url.searchParams.get('locality')?.trim();
+	const parsed = parseCacheRequest(request, {
+		resource: 'assignments',
+		segmentNames: ['endpointGroup', 'shard', 'customerId'],
+		searchNames: ['locality'],
+	});
 
-	if (resource !== 'assignments' || !endpointGroup || !shard || !customerId) {
-		return badRequest('Malformed assignment cache key');
+	if (parsed instanceof Response) {
+		return parsed;
 	}
 
-	if (!locality) {
-		return badRequest('Invalid locality');
-	}
-
-	for (const [name, value] of Object.entries({
-		customer: customerId,
-		endpoint: endpointGroup,
-		locality,
-		shard,
-	})) {
-		if (!value || !SAFE_CACHE_VALUE.test(value)) {
-			return badRequest(`Invalid ${name}`);
-		}
-	}
-
-	return { customerId, endpointGroup, locality, shard };
-}
-
-function readSafeParam(url: URL, name: string, fallback?: string): string | Response {
-	const value = url.searchParams.get(name)?.trim() ?? fallback;
-
-	if (!value) {
-		return badRequest(`Missing ${name}`);
-	}
-
-	if (!SAFE_CACHE_VALUE.test(value)) {
-		return badRequest(`${name} must be 1-128 chars: letters, numbers, dots, underscores, colons, or hyphens`);
-	}
-
-	return value;
-}
-
-function badRequest(message: string): Response {
-	return Response.json({ error: message }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+	return {
+		customerId: parsed.segments.customerId,
+		endpointGroup: parsed.segments.endpointGroup,
+		locality: parsed.search.locality,
+		shard: parsed.segments.shard,
+	};
 }
 
 function assignmentFromRow(row: AssignmentRow): Assignment {
@@ -247,12 +216,4 @@ function assignmentFromRow(row: AssignmentRow): Assignment {
 		updatedAt: row.updated_at,
 		source: 'durable-object-rpc',
 	};
-}
-
-async function hashToBucket(input: string, bucketCount: number): Promise<number> {
-	const bytes = new TextEncoder().encode(input);
-	const digest = await crypto.subtle.digest('SHA-256', bytes);
-	const view = new DataView(digest);
-
-	return view.getUint32(0) % bucketCount;
 }
